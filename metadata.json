@@ -1,0 +1,6 @@
+{
+  "name": "Combined Camera Studio",
+  "description": "Downloadable Windows Python desktop application combining 3D Liquid Cube, Air Drawing, and Selfie Puzzle into one camera window.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
