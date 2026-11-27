@@ -6,3 +6,10 @@ coverage/
 *.log
 .env*
 !.env.example
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.playwright-cli/
+combined_camera_studio/calibration.json
+combined_camera_studio/screenshots/*.png
