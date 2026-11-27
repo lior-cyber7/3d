@@ -18,7 +18,7 @@ const MODES: ModeSpec[] = [
     title: 'Liquid Cube',
     origin: 'Subham503/3D-Liquid-Cube-Simulation',
     summary:
-      'Interactive 3D shaded cube containing 350 Position-Based Dynamics fluid particles rendered as a soft Gaussian-blurred liquid body with specular highlights.',
+      'Interactive 3D shaded cube containing 260 Position-Based Dynamics fluid particles rendered as a soft ROI-accelerated Gaussian liquid body with specular highlights.',
     gestures: [
       'Open hand movement: rotate and tilt the cube with velocity-scaled spin and inertia',
       'Closed fist: freeze rotation and let liquid settle',
@@ -76,11 +76,18 @@ pip install -r requirements.txt
 python main.py`;
 
 const LINE_COUNTS = [
-  { project: '3D-Liquid-Cube-Simulation (before)', physical: '429', code: '334' },
-  { project: 'Gesture-Canvas (before)', physical: '1,214', code: '921' },
-  { project: 'selfie-puzzle-game (before)', physical: '1,605', code: '1,195' },
-  { project: 'Combined total before integration', physical: '3,248', code: '2,450', strong: true },
-  { project: 'combined_camera_studio (after integration)', physical: '1,411', code: '1,203', strong: true },
+  { project: 'Originals combined total (before integration)', physical: '3,248', code: '2,450' },
+  { project: 'combined_camera_studio v1 (initial integration)', physical: '1,411', code: '1,203' },
+  { project: 'combined_camera_studio v2 (calibration, gestures, FX)', physical: '1,944', code: '1,683' },
+  { project: 'combined_camera_studio v3 (AR HUD, One-Euro, ROI liquid, <1.5k)', physical: '1,704', code: '1,465', strong: true },
+];
+
+const BENCHMARKS = [
+  { screen: 'MENU (AR HUD + FX ON)', before: '43.66 FPS / 14.39 ms', after: '41.51 FPS / 16.63 ms', note: 'vs 40.12 FPS OFF (zero HUD lag)' },
+  { screen: 'CALIBRATE', before: '35.73 FPS / 14.10 ms', after: '34.85 FPS / 16.19 ms', note: 'Live ROI box + pinch meter' },
+  { screen: 'LIQUID_CUBE', before: '20.81 FPS / 15.90 ms', after: '29.22 FPS / 16.47 ms', note: '+40.4% FPS (half-res ROI glow)' },
+  { screen: 'AIR_DRAWING', before: '46.17 FPS / 15.32 ms', after: '43.89 FPS / 16.98 ms', note: 'Tracked stroke + glow LUT' },
+  { screen: 'SELFIE_PUZZLE', before: '37.84 FPS / 14.16 ms', after: '46.66 FPS / 17.04 ms', note: '+23.3% FPS (lighter tile loop)' },
 ];
 
 export default function App() {
@@ -188,12 +195,16 @@ export default function App() {
                 <dd className="font-mono text-slate-900">modes/*.py</dd>
               </div>
               <div className="flex justify-between py-2.5">
-                <dt className="text-slate-500">Hand Model Asset</dt>
-                <dd className="font-mono text-slate-900">assets/hand_landmarker.task</dd>
+                <dt className="text-slate-500">Hand Model &amp; Tracking</dt>
+                <dd className="font-mono text-slate-900">640×480 VIDEO mode</dd>
+              </div>
+              <div className="flex justify-between py-2.5">
+                <dt className="text-slate-500">Calibration, AR HUD &amp; FX</dt>
+                <dd className="font-mono text-slate-900">calibration.json / [K] [A] [V]</dd>
               </div>
               <div className="flex justify-between py-2.5">
                 <dt className="text-slate-500">Production Code</dt>
-                <dd className="font-mono tabular-nums text-slate-900">1,411 physical / 1,203 code</dd>
+                <dd className="font-mono tabular-nums text-slate-900">1,704 physical / 1,465 code</dd>
               </div>
               <div className="flex justify-between py-2.5">
                 <dt className="text-slate-500">Originals &amp; Backups</dt>
@@ -276,7 +287,7 @@ export default function App() {
             </div>
             <p className="text-sm text-slate-600">
               After downloading <code className="text-slate-900">combined_camera_studio.zip</code>, run these commands in
-              Windows PowerShell (Python 3.10 or 3.11 recommended):
+              Windows PowerShell (Python 3.11 or 3.10 recommended):
             </p>
             <pre className="overflow-x-auto rounded-xl border border-slate-200 bg-slate-900 p-5 text-xs leading-6 text-slate-100">
               <code>{POWERSHELL_COMMANDS}</code>
@@ -312,11 +323,18 @@ export default function App() {
 
         <section id="verification" className="border-t border-slate-200 pt-12 space-y-6">
           <div>
-            <h2 className="text-2xl font-bold tracking-tight text-slate-900">Line Counts &amp; Verification</h2>
+            <h2 className="text-2xl font-bold tracking-tight text-slate-900">Line Counts, Performance &amp; Verification</h2>
             <p className="mt-1 text-sm text-slate-600">
               Measured across production <code className="text-slate-900">.py</code> files excluding{' '}
               <code className="text-slate-900">backup_originals/</code>, <code className="text-slate-900">tests/</code>,
-              assets, and caches.
+              assets, and caches. Custom gestures (<strong className="text-slate-800">Open Palm</strong> Pause/Resume,{' '}
+              <strong className="text-slate-800">Thumbs-Up</strong> Confirmation,{' '}
+              <strong className="text-slate-800">Peace Sign</strong> Menu,{' '}
+              <strong className="text-slate-800">Pinch</strong> Select),{' '}
+              <strong className="text-slate-800">AR Hand HUD (A)</strong>,{' '}
+              <strong className="text-slate-800">Fingertip FX (V)</strong>, and{' '}
+              <strong className="text-slate-800">One-Euro Smoothing</strong> can be tuned via{' '}
+              <strong className="text-slate-800">Calibrate [K]</strong>.
             </p>
           </div>
           <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
@@ -339,13 +357,35 @@ export default function App() {
               </tbody>
             </table>
           </div>
+          <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-slate-200 bg-slate-50 text-slate-600">
+                <tr>
+                  <th className="px-5 py-3 font-semibold">Screen (1280×720 Synthetic AVI, CPU)</th>
+                  <th className="px-5 py-3 font-semibold text-right">v2 Baseline</th>
+                  <th className="px-5 py-3 font-semibold text-right">v3 Measured</th>
+                  <th className="px-5 py-3 font-semibold">Note</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-200">
+                {BENCHMARKS.map((row) => (
+                  <tr key={row.screen} className="text-slate-700">
+                    <td className="px-5 py-3 font-medium text-slate-900">{row.screen}</td>
+                    <td className="px-5 py-3 text-right font-mono tabular-nums">{row.before}</td>
+                    <td className="px-5 py-3 text-right font-mono tabular-nums font-semibold text-slate-900">{row.after}</td>
+                    <td className="px-5 py-3 text-xs text-slate-500">{row.note}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       </main>
 
       <footer className="border-t border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-6 py-6 text-xs text-slate-500">
           <span>Combined Camera Studio · MIT License · Attribution preserved in THIRD_PARTY_NOTICES.md</span>
-          <span>6/6 automated unit &amp; integration tests passed (headless synthetic video)</span>
+          <span>10/10 automated unit &amp; integration tests passed (headless synthetic 1280×720 AVI)</span>
         </div>
       </footer>
     </div>

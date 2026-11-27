@@ -34,7 +34,29 @@ three open-source projects, all licensed under the MIT License:
 
 ---
 
-All three original projects retain their full MIT License terms:
+## 4. Hand-AR (Reference Techniques)
+- Source: https://github.com/CoshkaX/Hand-AR
+- Author: Mehmet Akif Çoşkun (CoshkaX)
+- License: MIT License
+- Usage: Reference only for One-Euro pointer jitter filtering and threaded latest-frame / MJPG capability probing patterns.
+- Original Notice:
+  MIT License
+  Copyright (c) 2026 Mehmet Akif Çoşkun
+
+---
+
+## 5. Hand-Tracking-AR-UI (Visual HUD Reference)
+- Source: https://github.com/tubakhxn/Hand-Tracking-AR-UI
+- Author: Tuba Khan (tubakhxn)
+- License: MIT License
+- Usage: Visual reference only for lightweight radial AR palm reticle & fingertip feedback (`draw_ar_hand_hud`).
+- Original Notice:
+  MIT License
+  Copyright (c) 2025 Tuba Khan
+
+---
+
+All five referenced and integrated projects retain their full MIT License terms:
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

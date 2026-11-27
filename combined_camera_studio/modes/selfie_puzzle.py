@@ -13,8 +13,7 @@ from vision import HandData, HandTracker, WIN_H, WIN_W
 GRID_SIZE, NUM_PIECES = 3, 9
 PIECE_PX, TILE_GAP, BOARD_X, BOARD_Y = 190, 6, 60, 76
 BOARD_SPAN = GRID_SIZE * PIECE_PX + (GRID_SIZE - 1) * TILE_GAP
-PANEL_X = BOARD_X + BOARD_SPAN + 55
-PANEL_W = WIN_W - PANEL_X - 45
+PANEL_X, PANEL_W = BOARD_X + BOARD_SPAN + 55, WIN_W - (BOARD_X + BOARD_SPAN + 55) - 45
 
 
 class Puzzle:
@@ -29,10 +28,8 @@ class Puzzle:
         total = piece_size * GRID_SIZE
         resized = cv2.resize(image, (total, total), interpolation=cv2.INTER_LANCZOS4)
         self.source_image = resized
-        self.pieces = [
-            resized[r * piece_size:(r + 1) * piece_size, c * piece_size:(c + 1) * piece_size].copy()
-            for r in range(GRID_SIZE) for c in range(GRID_SIZE)
-        ]
+        self.pieces = [resized[r * piece_size:(r + 1) * piece_size, c * piece_size:(c + 1) * piece_size].copy()
+                       for r in range(GRID_SIZE) for c in range(GRID_SIZE)]
         self.arrangement = list(range(NUM_PIECES))
 
     def shuffle(self):
@@ -68,23 +65,25 @@ class SelfiePuzzleMode:
     def reset(self):
         self.phase, self.cap_state = "CAPTURE", "idle"
         self.anchor = self.cur_pt = self.locked_rect = self._input_src = None
-        self.start_time, self.completion_time, self.move_count = time.time(), None, 0
-        self.is_solved = self.show_preview = False
+        self.start_time, self.completion_time, self.move_count, self._pause_started = time.time(), None, 0, 0.0
+        self.paused = self.is_solved = self.show_preview = False
         self.dragging_pos = self.drag_src = None
         self.drag_offset, self.confetti = (0, 0), []
 
-    def _init_confetti(self):
-        self.confetti = [
-            [random.uniform(0, WIN_W), random.uniform(-WIN_H, 0), random.uniform(-1.5, 1.5), random.uniform(2.5, 6.0),
-             random.randint(6, 12), (random.randint(90, 255), random.randint(90, 255), random.randint(90, 255))]
-            for _ in range(75)
-        ]
+    def toggle_pause(self) -> bool:
+        if self.phase != "PLAY" or self.is_solved:
+            return False
+        self.paused = not self.paused
+        if self.paused:
+            self._pause_started, self.dragging_pos, self.drag_src = time.time(), None, None
+        else:
+            self.start_time += time.time() - self._pause_started
+        return self.paused
 
     def _start_puzzle(self, crop: np.ndarray):
-        self.puzzle.create_from_image(crop, PIECE_PX)
-        self.puzzle.shuffle()
+        self.puzzle.create_from_image(crop, PIECE_PX); self.puzzle.shuffle()
         self.phase, self.start_time, self.completion_time = "PLAY", time.time(), None
-        self.move_count, self.is_solved, self.show_preview = 0, False, False
+        self.move_count, self.paused, self.is_solved, self.show_preview = 0, False, False, False
         self.dragging_pos = self.drag_src = None
 
     def _tile_rect(self, pos: int) -> Tuple[int, int, int, int]:
@@ -100,18 +99,14 @@ class SelfiePuzzleMode:
     def _run_capture_phase(self, frame: np.ndarray, hand: HandData, mouse, key: int):
         clean = frame.copy()
         if key == ord("f") or (mouse.just_released and self.btn_quick.contains(mouse.pos)) or (hand.pinch_started and self.btn_quick.contains(hand.pinch_center)):
-            s = min(WIN_W, WIN_H) - 120
-            cx, cy = WIN_W // 2, WIN_H // 2
-            self._start_puzzle(clean[cy - s // 2:cy + s // 2, cx - s // 2:cx + s // 2])
-            return
+            s, cx, cy = min(WIN_W, WIN_H) - 120, WIN_W // 2, WIN_H // 2
+            self._start_puzzle(clean[cy - s // 2:cy + s // 2, cx - s // 2:cx + s // 2]); return
 
         if self.cap_state == "idle":
             if hand.is_pinching and hand.pinch_center and not self.btn_quick.contains(hand.pinch_center):
-                self.anchor = self.cur_pt = hand.pinch_center
-                self.cap_state, self._input_src = "drawing", "hand"
+                self.anchor = self.cur_pt = hand.pinch_center; self.cap_state, self._input_src = "drawing", "hand"
             elif mouse.just_pressed and not self.btn_quick.contains(mouse.pos) and mouse.pos[1] > 60:
-                self.anchor = self.cur_pt = mouse.pos
-                self.cap_state, self._input_src = "drawing", "mouse"
+                self.anchor = self.cur_pt = mouse.pos; self.cap_state, self._input_src = "drawing", "mouse"
         elif self.cap_state == "drawing":
             active = (hand.is_pinching and hand.pinch_center) if self._input_src == "hand" else mouse.down
             pt = hand.pinch_center if self._input_src == "hand" else mouse.pos
@@ -121,63 +116,51 @@ class SelfiePuzzleMode:
                 x1, x2 = sorted((self.anchor[0], self.cur_pt[0]))
                 y1, y2 = sorted((self.anchor[1], self.cur_pt[1]))
                 if (x2 - x1) >= 90 and (y2 - y1) >= 90:
-                    self.locked_rect = (max(0, x1), max(0, y1), min(WIN_W, x2), min(WIN_H, y2))
-                    self.cap_state = "locked"
+                    self.locked_rect, self.cap_state = (max(0, x1), max(0, y1), min(WIN_W, x2), min(WIN_H, y2)), "locked"
                 else:
                     self.cap_state = "idle"
         elif self.cap_state == "locked" and self.locked_rect:
             x1, y1, x2, y2 = self.locked_rect
             if key in (13, 32):
-                self._start_puzzle(clean[y1:y2, x1:x2])
-                return
+                self._start_puzzle(clean[y1:y2, x1:x2]); return
             for pt, clicked in ((hand.pinch_center, hand.pinch_started), (mouse.pos, mouse.just_released)):
                 if clicked and pt:
                     if x1 <= pt[0] <= x2 and y1 <= pt[1] <= y2:
-                        self._start_puzzle(clean[y1:y2, x1:x2])
-                        return
+                        self._start_puzzle(clean[y1:y2, x1:x2]); return
                     elif not self.btn_quick.contains(pt):
                         self.cap_state, self.locked_rect = "idle", None
 
         if self.cap_state == "drawing" and self.anchor and self.cur_pt:
             x1, x2 = sorted((self.anchor[0], self.cur_pt[0]))
             y1, y2 = sorted((self.anchor[1], self.cur_pt[1]))
-            glass_panel(frame, x1, y1, x2 - x1, y2 - y1, alpha=0.20, border_color=ACCENT_ORANGE, bg_color=ACCENT_ORANGE, border_thickness=3)
+            glass_panel(frame, x1, y1, x2 - x1, y2 - y1, 0.20, ACCENT_ORANGE, ACCENT_ORANGE, 3)
         elif self.cap_state == "locked" and self.locked_rect:
             x1, y1, x2, y2 = self.locked_rect
-            glass_panel(frame, x1, y1, x2 - x1, y2 - y1, alpha=0.18, border_color=ACCENT_GREEN, bg_color=ACCENT_GREEN, border_thickness=3)
+            glass_panel(frame, x1, y1, x2 - x1, y2 - y1, 0.18, ACCENT_GREEN, ACCENT_GREEN, 3)
             cv2.putText(frame, "Pinch/Click inside to CAPTURE!", ((x1 + x2) // 2 - 140, (y1 + y2) // 2), FONT_SMALL, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
-        msg = {
-            "idle": "Pinch & drag (or mouse drag) to select selfie region",
-            "drawing": "Release to lock selection box",
-            "locked": "Pinch/Click inside box to capture | Outside to reset",
-        }[self.cap_state]
-        glass_panel(frame, 290, 14, WIN_W - 520, 40, alpha=0.65)
-        cv2.putText(frame, msg, (308, 40), FONT_SMALL, 0.52, TEXT_PRIMARY, 1, cv2.LINE_AA)
+        msg = {"idle": "Pinch & drag (or mouse drag) for selfie region", "drawing": "Release to lock selection box",
+               "locked": "Pinch/Click inside to capture | Outside resets"}[self.cap_state]
+        glass_panel(frame, 520, 14, 535, 38, alpha=0.68)
+        cv2.putText(frame, msg, (534, 39), FONT_SMALL, 0.48, TEXT_PRIMARY, 1, cv2.LINE_AA)
         self.btn_quick.draw(frame, hovered=self.btn_quick.contains(mouse.pos) or self.btn_quick.contains(hand.pinch_center))
         HandTracker.draw_skeleton(frame, hand)
         draw_pointer(frame, hand.pinch_center if hand.is_pinching else hand.index_tip, pinching=hand.is_pinching)
 
     def _run_play_phase(self, frame: np.ndarray, hand: HandData, mouse, key: int):
         cam_pip = frame.copy()
-        if key == ord("r"):
-            self._start_puzzle(self.puzzle.source_image); return
-        if key == ord("n"):
-            self.reset(); return
-        if key == ord("p"):
-            self.show_preview = not self.show_preview
+        if key == ord("r"): self._start_puzzle(self.puzzle.source_image); return
+        if key == ord("n"): self.reset(); return
+        if key == ord("p"): self.show_preview = not self.show_preview
 
         cursor = (hand.pinch_center if hand.is_pinching else hand.index_tip) if hand.detected else mouse.pos
         for ptr, clicked in ((mouse.pos, mouse.just_released), (hand.pinch_center, hand.pinch_started)):
             if clicked and ptr:
-                if self.btn_preview.contains(ptr):
-                    self.show_preview = not self.show_preview
-                elif self.btn_restart.contains(ptr):
-                    self._start_puzzle(self.puzzle.source_image); return
-                elif self.btn_new.contains(ptr):
-                    self.reset(); return
+                if self.btn_preview.contains(ptr): self.show_preview = not self.show_preview
+                elif self.btn_restart.contains(ptr): self._start_puzzle(self.puzzle.source_image); return
+                elif self.btn_new.contains(ptr): self.reset(); return
 
-        if not self.is_solved:
+        if not self.is_solved and not self.paused:
             if self.dragging_pos is None:
                 if hand.pinch_started and hand.pinch_center and (p := self._pos_at(hand.pinch_center)) is not None:
                     rx, ry, _, _ = self._tile_rect(p)
@@ -191,15 +174,15 @@ class SelfiePuzzleMode:
                 if not still_held:
                     target = self._pos_at(drop_pt)
                     if target is not None and target != self.dragging_pos:
-                        self.puzzle.swap_pieces(self.dragging_pos, target)
-                        self.move_count += 1
+                        self.puzzle.swap_pieces(self.dragging_pos, target); self.move_count += 1
                         if self.puzzle.is_solved():
                             self.is_solved, self.completion_time = True, time.time()
-                            self._init_confetti()
+                            self.confetti = [[random.uniform(0, WIN_W), random.uniform(-WIN_H, 0), random.uniform(-1.5, 1.5), random.uniform(2.5, 6.0),
+                                              random.randint(6, 12), (random.randint(90, 255), random.randint(90, 255), random.randint(90, 255))] for _ in range(75)]
                     self.dragging_pos = self.drag_src = None
 
         frame[:] = (15, 17, 26)
-        glass_panel(frame, BOARD_X - 8, BOARD_Y - 8, BOARD_SPAN + 16, BOARD_SPAN + 16, alpha=0.95, border_color=(55, 65, 95), bg_color=(24, 28, 44))
+        glass_panel(frame, BOARD_X - 8, BOARD_Y - 8, BOARD_SPAN + 16, BOARD_SPAN + 16, 0.95, (55, 65, 95), (24, 28, 44))
         for pos in range(NUM_PIECES):
             if pos == self.dragging_pos:
                 continue
@@ -218,17 +201,17 @@ class SelfiePuzzleMode:
             frame[BOARD_Y:BOARD_Y + BOARD_SPAN, BOARD_X:BOARD_X + BOARD_SPAN] = cv2.resize(self.puzzle.source_image, (BOARD_SPAN, BOARD_SPAN))
             cv2.putText(frame, "PREVIEW", (BOARD_X + 14, BOARD_Y + 34), FONT, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
-        glass_panel(frame, PANEL_X, BOARD_Y - 8, PANEL_W, BOARD_SPAN + 16, alpha=0.92, border_color=(55, 65, 95), bg_color=(22, 26, 40))
-        pip_w = PANEL_W - 110
-        pip_h = int(pip_w * 9 / 16)
+        glass_panel(frame, PANEL_X, BOARD_Y - 8, PANEL_W, BOARD_SPAN + 16, 0.92, (55, 65, 95), (22, 26, 40))
+        pip_w, pip_h = PANEL_W - 110, int((PANEL_W - 110) * 9 / 16)
         pip_x, pip_y = PANEL_X + (PANEL_W - pip_w) // 2, BOARD_Y + 12
         HandTracker.draw_skeleton(cam_pip, hand)
         frame[pip_y:pip_y + pip_h, pip_x:pip_x + pip_w] = cv2.resize(cam_pip, (pip_w, pip_h))
         cv2.rectangle(frame, (pip_x, pip_y), (pip_x + pip_w, pip_y + pip_h), ACCENT_CYAN if hand.detected else (70, 80, 110), 1)
 
-        mins, secs = divmod(int((self.completion_time or time.time()) - self.start_time), 60)
+        elapsed_now = self._pause_started if self.paused else (self.completion_time or time.time())
+        mins, secs = divmod(max(0, int(elapsed_now - self.start_time)), 60)
         cv2.putText(frame, f"Time: {mins:02d}:{secs:02d}   Moves: {self.move_count}", (PANEL_X + 35, pip_y + pip_h + 36), FONT_SMALL, 0.62, TEXT_PRIMARY, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"Correct: {self.puzzle.correct_count()}/9", (PANEL_X + 35, pip_y + pip_h + 66), FONT_SMALL, 0.56, ACCENT_GREEN if self.is_solved else TEXT_MUTED, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Correct: {self.puzzle.correct_count()}/9" + ("  [PAUSED]" if self.paused else ""), (PANEL_X + 35, pip_y + pip_h + 66), FONT_SMALL, 0.56, ACCENT_ORANGE if self.paused else (ACCENT_GREEN if self.is_solved else TEXT_MUTED), 1, cv2.LINE_AA)
 
         self.btn_preview.active = self.show_preview
         for btn in (self.btn_preview, self.btn_restart, self.btn_new):
@@ -239,8 +222,7 @@ class SelfiePuzzleMode:
             glass_panel(frame, BOARD_X, BOARD_Y + BOARD_SPAN // 2 - 90, BOARD_SPAN, 180, alpha=0.82, border_color=ACCENT_GREEN)
             for c in self.confetti:
                 c[0] += c[2]; c[1] += c[3]
-                if c[1] > WIN_H:
-                    c[1], c[0] = -10, random.uniform(0, WIN_W)
+                if c[1] > WIN_H: c[1], c[0] = -10, random.uniform(0, WIN_W)
                 cv2.circle(frame, (int(c[0]), int(c[1])), c[4] // 2, c[5], -1)
             cv2.putText(frame, "PUZZLE SOLVED!", (BOARD_X + 115, BOARD_Y + BOARD_SPAN // 2 - 15), FONT, 1.25, ACCENT_GREEN, 2, cv2.LINE_AA)
             cv2.putText(frame, f"Time {mins:02d}:{secs:02d}  |  Moves {self.move_count}  |  Press R or N", (BOARD_X + 90, BOARD_Y + BOARD_SPAN // 2 + 38), FONT_SMALL, 0.62, TEXT_PRIMARY, 1, cv2.LINE_AA)

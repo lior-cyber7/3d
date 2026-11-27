@@ -1,10 +1,13 @@
-"""Shared camera, MediaPipe hand tracking, and gesture helpers."""
+"""Shared camera, MediaPipe hand tracking, One-Euro smoothing, calibration, and gestures."""
 
 from dataclasses import dataclass, field
+import json
 import math
 import os
 import sys
-from typing import List, Optional, Tuple, Union
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import mediapipe as mp
@@ -13,40 +16,116 @@ from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
 
 WIN_W, WIN_H = 1280, 720
-
 HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
+    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (5, 9), (9, 10),
+    (10, 11), (11, 12), (9, 13), (13, 14), (14, 15), (15, 16), (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
 ]
+LANDMARK_NAMES = ("WRIST", "TH_CMC", "TH_MCP", "TH_IP", "TH_TIP", "IX_MCP", "IX_PIP", "IX_DIP", "IX_TIP", "MD_MCP", "MD_PIP", "MD_DIP", "MD_TIP", "RG_MCP", "RG_PIP", "RG_DIP", "RG_TIP", "PK_MCP", "PK_PIP", "PK_DIP", "PK_TIP")
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL_PATH = os.path.join(ROOT_DIR, "assets", "hand_landmarker.task")
+CALIBRATION_PATH = os.path.join(ROOT_DIR, "calibration.json")
 
-LANDMARK_NAMES = [
-    "WRIST", "TH_CMC", "TH_MCP", "TH_IP", "TH_TIP", "IX_MCP", "IX_PIP", "IX_DIP", "IX_TIP",
-    "MD_MCP", "MD_PIP", "MD_DIP", "MD_TIP", "RG_MCP", "RG_PIP", "RG_DIP", "RG_TIP",
-    "PK_MCP", "PK_PIP", "PK_DIP", "PK_TIP",
-]
+CALIBRATION_PRESETS: Dict[str, Dict[str, Any]] = {
+    "Low": {"sensitivity": 0.80, "usable_area": 0.95, "pinch_threshold": 0.045, "stability_frames": 3, "smoothing": 0.68},
+    "Balanced": {"sensitivity": 1.00, "usable_area": 0.85, "pinch_threshold": 0.055, "stability_frames": 2, "smoothing": 0.45},
+    "High": {"sensitivity": 1.25, "usable_area": 0.72, "pinch_threshold": 0.068, "stability_frames": 1, "smoothing": 0.22},
+}
+DEFAULT_CALIBRATION: Dict[str, Any] = {
+    "preset": "Balanced", "sensitivity": 1.00, "usable_area": 0.85,
+    "pinch_threshold": 0.055, "stability_frames": 2, "smoothing": 0.45,
+    "confidence": 0.65, "fx_enabled": True, "ar_hud_enabled": True,
+    "track_w": 640, "track_h": 480,
+    "gesture_pause": True, "gesture_thumbs": True, "gesture_peace": True,
+    "thumbs_phrase": "Great! Action confirmed!",
+}
+_NUM_BOUNDS = {
+    "sensitivity": (0.70, 1.60, 2), "usable_area": (0.60, 1.00, 2),
+    "pinch_threshold": (0.030, 0.095, 3), "smoothing": (0.00, 0.85, 2), "confidence": (0.40, 0.90, 2),
+}
 
-DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hand_landmarker.task")
+
+def clamp_calibration(raw: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(DEFAULT_CALIBRATION)
+    if isinstance(raw, dict):
+        cfg.update(raw)
+    for k, (lo, hi, dec) in _NUM_BOUNDS.items():
+        cfg[k] = round(float(np.clip(cfg[k], lo, hi)), dec)
+    cfg["stability_frames"] = int(np.clip(int(cfg["stability_frames"]), 1, 5))
+    for k in ("fx_enabled", "ar_hud_enabled", "gesture_pause", "gesture_thumbs", "gesture_peace"):
+        cfg[k] = bool(cfg[k])
+    cfg["thumbs_phrase"] = str(cfg.get("thumbs_phrase") or DEFAULT_CALIBRATION["thumbs_phrase"])[:48]
+    return cfg
+
+
+def load_calibration(path: str = CALIBRATION_PATH) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return clamp_calibration(json.load(f))
+    except Exception:
+        return dict(DEFAULT_CALIBRATION)
+
+
+def save_calibration(cfg: Dict[str, Any], path: str = CALIBRATION_PATH) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(clamp_calibration(cfg), f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def parse_camera_source(raw: str) -> Union[int, str]:
-    """Convert numeric strings like '0' into int indices; keep URLs/paths as str."""
     text = (raw or "").strip()
-    if not text:
-        return 0
-    return int(text) if text.isdigit() else text
+    return 0 if not text else (int(text) if text.isdigit() else text)
+
+
+class _OneEuro2D:
+    """Casiez et al. One-Euro filter for 2D pointer jitter reduction (adapted from Hand-AR, MIT)."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._x, self._dx, self._t = None, (0.0, 0.0), None
+
+    def filter(self, pt: Tuple[int, int], smoothing: float, now: Optional[float] = None) -> Tuple[int, int]:
+        if smoothing <= 0.02 or self._x is None or self._t is None:
+            self._x, self._t = (float(pt[0]), float(pt[1])), (time.perf_counter() if now is None else now)
+            return pt
+        t = time.perf_counter() if now is None else now
+        freq = 1.0 / max(1e-3, t - self._t)
+        self._t = t
+        # Higher smoothing -> lower min_cutoff & beta (steadier at rest, slight trail lag)
+        min_cutoff = 4.5 - 3.9 * (smoothing / 0.85)
+        beta = 0.25 * (1.0 - smoothing) + 0.01
+        ad = 1.0 / (1.0 + freq / (2.0 * math.pi * 1.0))
+        dx0 = (pt[0] - self._x[0]) * freq
+        dx1 = (pt[1] - self._x[1]) * freq
+        edx0 = ad * dx0 + (1.0 - ad) * self._dx[0]
+        edx1 = ad * dx1 + (1.0 - ad) * self._dx[1]
+        self._dx = (edx0, edx1)
+        ax = 1.0 / (1.0 + freq / max(0.2, 2.0 * math.pi * (min_cutoff + beta * abs(edx0))))
+        ay = 1.0 / (1.0 + freq / max(0.2, 2.0 * math.pi * (min_cutoff + beta * abs(edx1))))
+        sx = ax * pt[0] + (1.0 - ax) * self._x[0]
+        sy = ay * pt[1] + (1.0 - ay) * self._x[1]
+        self._x = (sx, sy)
+        return int(sx), int(sy)
 
 
 class CameraSource:
-    """Owns the single shared cv2.VideoCapture across the menu and all modes."""
+    """Shared VideoCapture using a latest-frame capture thread for live streams."""
 
     def __init__(self, source: str = "0", width: int = WIN_W, height: int = WIN_H):
         self.source_str = str(source).strip() or "0"
         self.width, self.height = width, height
         self.cap: Optional[cv2.VideoCapture] = None
-        self.last_error = ""
-        self.is_live = False
-        self.is_file = False
+        self.last_error, self.is_live, self.is_file = "", False, False
+        self.stream_fps, self.buffer_prop_supported = 0.0, False
+        self.buffer_prop_note = "Not opened"
+        self._lock, self._stop_evt = threading.Lock(), threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._latest_frame: Optional[np.ndarray] = None
+        self._cam_stamps: List[float] = []
 
     def open(self, source: Optional[str] = None) -> bool:
         if source is not None:
@@ -55,93 +134,157 @@ class CameraSource:
         self.last_error = ""
         parsed = parse_camera_source(self.source_str)
         self.is_file = isinstance(parsed, str) and os.path.isfile(parsed)
-
         cap = None
         if isinstance(parsed, int) and sys.platform.startswith("win"):
             for backend in (cv2.CAP_DSHOW, cv2.CAP_ANY):
                 cand = cv2.VideoCapture(parsed, backend)
                 if cand.isOpened():
-                    cap = cand
-                    break
+                    cap = cand; break
                 cand.release()
         else:
             cand = cv2.VideoCapture(parsed)
-            if cand.isOpened():
-                cap = cand
-            else:
-                cand.release()
-
+            if cand.isOpened(): cap = cand
+            else: cand.release()
         if cap is None or not cap.isOpened():
-            self.last_error = (
-                f"Could not open camera '{self.source_str}'. "
-                "Enter a local index (0, 1) or full stream URL (e.g. http://<ip>:<port>/video)."
-            )
+            self.last_error = f"Could not open camera '{self.source_str}'. Enter index (0, 1) or full stream URL."
             return False
 
+        mjpg_note = ""
         if isinstance(parsed, int):
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height); cap.set(cv2.CAP_PROP_FPS, 30.0)
+            fc = int(cap.get(cv2.CAP_PROP_FOURCC))
+            fc_str = "".join(chr((fc >> (8 * i)) & 0xFF) for i in range(4)).strip() or "?"
+            mjpg_note = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} {fc_str} | "
+
+        set_ok = bool(cap.set(cv2.CAP_PROP_BUFFERSIZE, 1))
+        buf_val = cap.get(cv2.CAP_PROP_BUFFERSIZE)
+        self.buffer_prop_supported = bool(set_ok and abs(buf_val - 1.0) < 0.01)
+        self.buffer_prop_note = (f"{mjpg_note}CAP_PROP_BUFFERSIZE=1 active" if self.buffer_prop_supported
+                                 else f"{mjpg_note}BUFFERSIZE unsupported (val={buf_val:.0f}); latest-frame drop active")
 
         ok, test_frame = cap.read()
         if not ok or test_frame is None or test_frame.size == 0:
-            cap.release()
-            self.last_error = (
-                f"Connected to '{self.source_str}' but received no frames. "
-                "Check that the camera or stream is active and not in use."
-            )
-            return False
+            cap.release(); self.last_error = f"Connected to '{self.source_str}' but received no frames."; return False
 
-        self.cap = cap
-        self.is_live = True
+        self.cap, self.is_live, self._latest_frame = cap, True, test_frame
+        self._cam_stamps = [time.perf_counter()]
+        self.stream_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if self.is_file else 0.0
+        if not self.is_file:
+            self._stop_evt.clear()
+            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self._thread.start()
         return True
 
-    def read_frame(self, flip: bool = True) -> Tuple[bool, Optional[np.ndarray]]:
-        if self.cap is None or not self.cap.isOpened():
-            return False, None
-        ok, frame = self.cap.read()
-        if (not ok or frame is None) and self.is_file:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    def _capture_loop(self):
+        misses = 0
+        while not self._stop_evt.is_set() and self.cap is not None:
             ok, frame = self.cap.read()
-        if not ok or frame is None or frame.size == 0:
+            if ok and frame is not None and frame.size > 0:
+                misses, now = 0, time.perf_counter()
+                with self._lock:
+                    self._latest_frame = frame
+                    self._cam_stamps = (self._cam_stamps + [now])[-20:]
+                    if len(self._cam_stamps) >= 2:
+                        dt = self._cam_stamps[-1] - self._cam_stamps[0]
+                        self.stream_fps = (len(self._cam_stamps) - 1) / dt if dt > 0 else 0.0
+            else:
+                misses += 1
+                if misses > 45:
+                    self.last_error, self.is_live = f"Stream '{self.source_str}' stopped sending frames.", False; break
+                time.sleep(0.005)
+
+    def read_frame(self, flip: bool = True) -> Tuple[bool, Optional[np.ndarray]]:
+        if self.cap is None or not self.is_live:
             return False, None
-        if flip:
-            frame = cv2.flip(frame, 1)
+        if self.is_file:
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self.cap.read()
+            if not ok or frame is None or frame.size == 0: return False, None
+        else:
+            with self._lock: frame = self._latest_frame
+            if frame is None: return False, None
+            frame = frame.copy()
+        if flip: frame = cv2.flip(frame, 1)
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
         return True, frame
 
     def release(self):
+        self._stop_evt.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        self._thread = None
         if self.cap is not None:
             try:
-                if self.cap.isOpened():
-                    self.cap.release()
+                if self.cap.isOpened(): self.cap.release()
             finally:
                 self.cap = None
-                self.is_live = False
+        self._latest_frame, self.is_live, self.stream_fps = None, False, 0.0
 
 
 class PinchDebouncer:
-    """Detects clean pinch rising edges with frame cooldown to prevent double triggers."""
-
-    def __init__(self, cooldown_frames: int = 14):
+    def __init__(self, cooldown_frames: int = 10, stability_frames: int = 1):
         self.cooldown_frames = max(1, int(cooldown_frames))
-        self._was_pinching = False
-        self._cooldown = 0
+        self.stability_frames = max(1, int(stability_frames))
+        self._was_latched, self._held_count, self._cooldown = False, 0, 0
 
     def update(self, is_pinching: bool) -> bool:
         ready = self._cooldown == 0
         if self._cooldown > 0:
             self._cooldown -= 1
-        started = bool(is_pinching and not self._was_pinching)
-        self._was_pinching = bool(is_pinching)
-        if started and ready:
-            self._cooldown = self.cooldown_frames
-            return True
+        if not is_pinching:
+            self._held_count, self._was_latched = 0, False
+            return False
+        self._held_count += 1
+        if not self._was_latched and self._held_count >= self.stability_frames:
+            self._was_latched = True
+            if ready:
+                self._cooldown = self.cooldown_frames
+                return True
         return False
 
     def reset(self):
-        self._was_pinching = False
-        self._cooldown = 0
+        self._was_latched, self._held_count, self._cooldown = False, 0, 0
+
+
+def classify_hand_pose(pts: List[Tuple[int, int]], palm_px: float, is_pinch: bool) -> str:
+    if len(pts) < 21 or palm_px < 12.0 or is_pinch:
+        return "NONE"
+    _d = lambda a, b: math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1])
+    ext = [pts[t][1] < pts[p][1] - 5 and _d(t, 0) > _d(p, 0) * 1.12 for t, p in ((8, 6), (12, 10), (16, 14), (20, 18))]
+    curled = [_d(t, 0) < _d(p, 0) * 1.08 for t, p in ((8, 6), (12, 10), (16, 14), (20, 18))]
+    thumb_up = pts[4][1] < pts[3][1] - 4 and pts[4][1] < pts[2][1] - 8 and pts[4][1] < pts[5][1] - 6
+    if ext[0] and ext[1] and curled[2] and curled[3] and _d(8, 12) > palm_px * 0.18:
+        return "PEACE"
+    if thumb_up and all(curled):
+        return "THUMBS_UP"
+    if all(ext) and _d(4, 5) > palm_px * 0.25:
+        return "OPEN_PALM"
+    return "NONE"
+
+
+class GestureDebouncer:
+    def __init__(self, hold_frames: int = 4, cooldown_sec: float = 1.5):
+        self.hold_frames, self.cooldown_sec = max(1, int(hold_frames)), max(0.1, float(cooldown_sec))
+        self._cur_pose, self._count, self._latched, self._last_fire = "NONE", 0, "NONE", {}
+
+    def update(self, pose: str, now: Optional[float] = None) -> Optional[str]:
+        t = time.perf_counter() if now is None else now
+        if pose == "NONE":
+            self._cur_pose, self._count, self._latched = "NONE", 0, "NONE"
+            return None
+        self._count = (self._count + 1) if pose == self._cur_pose else 1
+        self._cur_pose = pose
+        if self._count >= self.hold_frames and self._latched != pose and (t - self._last_fire.get(pose, -1e9) >= self.cooldown_sec):
+            self._latched, self._last_fire[pose] = pose, t
+            return pose
+        return None
+
+    def reset(self):
+        self._cur_pose, self._count, self._latched = "NONE", 0, "NONE"
 
 
 @dataclass
@@ -157,29 +300,42 @@ class HandData:
     pinch_started: bool = False
     is_open_hand: bool = False
     draw_gesture: str = "NO_HAND"
+    pose: str = "NONE"
+    action_gesture: Optional[str] = None
 
 
 class HandTracker:
-    """Single MediaPipe HandLandmarker shared by the menu and all three modes."""
+    """Single MediaPipe HandLandmarker (640x480 VIDEO mode), One-Euro filter, hysteresis pinch, and gestures."""
 
-    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, detection_confidence: float = 0.65, pinch_threshold: float = 0.055):
+    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, cfg: Optional[Dict[str, Any]] = None):
         self.model_path = model_path
-        self.detection_confidence = float(detection_confidence)
-        self.pinch_threshold = float(pinch_threshold)
-        self.debouncer = PinchDebouncer(cooldown_frames=14)
-        self._detector = None
+        c = clamp_calibration(cfg or DEFAULT_CALIBRATION)
+        self.detection_confidence, self.pinch_threshold = c["confidence"], c["pinch_threshold"]
+        self.sensitivity, self.usable_area, self.smoothing = c["sensitivity"], c["usable_area"], c["smoothing"]
+        self.track_size = (int(c["track_w"]), int(c["track_h"]))
+        self.debouncer = PinchDebouncer(10, c["stability_frames"])
+        self.gesture_debouncer = GestureDebouncer(4, 1.5)
+        self._euro = _OneEuro2D()
+        self._detector, self._last_ts_ms, self._pinch_held = None, 0, False
+        self.last_track_ms = self.avg_track_ms = 0.0
         self.load_error = ""
         self._build_detector()
 
+    def apply_calibration(self, cfg: Dict[str, Any]):
+        c = clamp_calibration(cfg)
+        self.pinch_threshold, self.sensitivity, self.usable_area, self.smoothing = c["pinch_threshold"], c["sensitivity"], c["usable_area"], c["smoothing"]
+        self.debouncer.stability_frames = c["stability_frames"]
+        self.set_confidence(c["confidence"])
+
     def _build_detector(self):
         self.close()
+        self._last_ts_ms = 0
         if not os.path.isfile(self.model_path):
-            self.load_error = f"Missing MediaPipe model: {self.model_path}"
-            return
+            self.load_error = f"Missing MediaPipe model: {self.model_path}"; return
         try:
             opts = mp_vision.HandLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=self.model_path),
-                num_hands=1,
+                running_mode=mp_vision.RunningMode.VIDEO, num_hands=1,
                 min_hand_detection_confidence=self.detection_confidence,
                 min_hand_presence_confidence=self.detection_confidence,
                 min_tracking_confidence=self.detection_confidence,
@@ -187,48 +343,60 @@ class HandTracker:
             self._detector = mp_vision.HandLandmarker.create_from_options(opts)
             self.load_error = ""
         except Exception as exc:
-            self._detector = None
-            self.load_error = f"Hand tracker init failed: {exc}"
+            self._detector, self.load_error = None, f"Hand tracker init failed: {exc}"
 
     def set_confidence(self, confidence: float):
-        clamped = float(np.clip(confidence, 0.35, 0.90))
+        clamped = float(np.clip(confidence, 0.40, 0.90))
         if abs(clamped - self.detection_confidence) >= 0.04:
             self.detection_confidence = clamped
             self._build_detector()
 
-    def set_pinch_threshold(self, threshold: float):
-        self.pinch_threshold = float(np.clip(threshold, 0.025, 0.11))
+    def _map_cursor(self, nx: float, ny: float, w: int, h: int) -> Tuple[int, int]:
+        u = max(0.45, self.usable_area)
+        return (int(np.clip(0.5 + ((nx - 0.5) / u) * self.sensitivity, 0.0, 1.0) * (w - 1)),
+                int(np.clip(0.5 + ((ny - 0.5) / u) * self.sensitivity, 0.0, 1.0) * (h - 1)))
 
     def process(self, frame_bgr: np.ndarray) -> HandData:
         if self._detector is None or frame_bgr is None:
-            self.debouncer.update(False)
+            self.debouncer.update(False); self.gesture_debouncer.update("NONE"); self._euro.reset(); self._pinch_held = False
             return HandData()
+        t0 = time.perf_counter()
         h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        result = self._detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+        tw, th = self.track_size
+        small = cv2.resize(frame_bgr, (tw, th), interpolation=cv2.INTER_LINEAR) if (w != tw or h != th) else frame_bgr
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        self._last_ts_ms = max(self._last_ts_ms + 1, int(time.perf_counter() * 1000))
+        result = self._detector.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), self._last_ts_ms)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        self.last_track_ms = dt_ms
+        self.avg_track_ms = dt_ms if self.avg_track_ms == 0.0 else (0.85 * self.avg_track_ms + 0.15 * dt_ms)
+
         if not result.hand_landmarks:
-            self.debouncer.update(False)
+            self.debouncer.update(False); self.gesture_debouncer.update("NONE"); self._euro.reset(); self._pinch_held = False
             return HandData()
 
         lm = result.hand_landmarks[0]
         pts = [(int(p.x * w), int(p.y * h)) for p in lm]
         thumb, index = lm[4], lm[8]
-        pinch_norm = math.hypot(thumb.x - index.x, thumb.y - index.y)
+        palm_norm = math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y)
+        pinch_norm = math.hypot(thumb.x - index.x, thumb.y - index.y) * (0.16 / max(0.06, palm_norm))
         pinch_px = math.hypot((thumb.x - index.x) * w, (thumb.y - index.y) * h)
-        is_pinch = pinch_norm < self.pinch_threshold
+        # Hysteresis release threshold avoids jitter drops mid-drag
+        is_pinch = pinch_norm < (self.pinch_threshold * 1.28 if self._pinch_held else self.pinch_threshold)
+        self._pinch_held = is_pinch
         pinch_started = self.debouncer.update(is_pinch)
-        pinch_center = ((pts[4][0] + pts[8][0]) // 2, (pts[4][1] + pts[8][1]) // 2)
+
+        tip = self._euro.filter(self._map_cursor(index.x, index.y, w, h), self.smoothing)
+        p_ctr = self._map_cursor((thumb.x + index.x) * 0.5, (thumb.y + index.y) * 0.5, w, h)
 
         wrist = np.array([lm[0].x, lm[0].y, lm[0].z])
         scale = float(np.linalg.norm(np.array([lm[17].x, lm[17].y, lm[17].z]) - wrist)) + 1e-6
-        avg_dist = float(np.mean([np.linalg.norm(np.array([lm[t].x, lm[t].y, lm[t].z]) - wrist) for t in (4, 8, 12, 16, 20)]))
-        open_hand = (avg_dist / scale) > 0.28
+        open_hand = (float(np.mean([np.linalg.norm(np.array([lm[t].x, lm[t].y, lm[t].z]) - wrist) for t in (4, 8, 12, 16, 20)])) / scale) > 0.28
+        draw_gesture = "DRAW" if (pts[8][1] < pts[6][1] and pts[12][1] >= pts[10][1] and pts[16][1] >= pts[14][1] and pts[20][1] >= pts[18][1]) else "STOP"
 
-        idx_up = pts[8][1] < pts[6][1]
-        curled = (pts[12][1] >= pts[10][1]) and (pts[16][1] >= pts[14][1]) and (pts[20][1] >= pts[18][1])
-        draw_gesture = "DRAW" if (idx_up and curled) else "STOP"
-
-        return HandData(True, lm, pts, pts[8], pinch_center, pinch_norm, pinch_px, is_pinch, pinch_started, open_hand, draw_gesture)
+        palm_px = math.hypot(pts[17][0] - pts[0][0], pts[17][1] - pts[0][1]) + 1.0
+        pose = classify_hand_pose(pts, palm_px, is_pinch)
+        return HandData(True, lm, pts, tip, p_ctr, pinch_norm, pinch_px, is_pinch, pinch_started, open_hand, draw_gesture, pose, self.gesture_debouncer.update(pose))
 
     @staticmethod
     def draw_skeleton(frame: np.ndarray, hand: HandData, bone_color=(255, 220, 40), dot_color=(245, 245, 255)):
@@ -238,11 +406,12 @@ class HandTracker:
         for s, e in HAND_CONNECTIONS:
             cv2.line(frame, pts[s], pts[e], bone_color, 2, cv2.LINE_AA)
         for px, py in pts:
-            cv2.circle(frame, (px, py), 4, dot_col := dot_color, -1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 4, dot_color, -1, cv2.LINE_AA)
 
     def close(self):
         if self._detector is not None:
+            det, self._detector = self._detector, None
             try:
-                self._detector.close()
-            finally:
-                self._detector = None
+                det.close()
+            except Exception:
+                pass
