@@ -84,13 +84,3 @@ python main.py --camera "http://<phone-ip>:<port>/video"
 - **Verification Scope**: Automated tests (`10/10` passing) and benchmarks were executed headless on Linux using synthetic `1280×720` video; live physical Windows webcam (`DirectShow`) and live Wi-Fi phone stream URL playback have **not** yet been verified on Windows hardware.
 
 ---
-
-## Credits & License
-
-Licensed under the **MIT License**. See [`combined_camera_studio/LICENSE`](./combined_camera_studio/LICENSE) and [`combined_camera_studio/THIRD_PARTY_NOTICES.md`](./combined_camera_studio/THIRD_PARTY_NOTICES.md) for full attribution to:
-
-- [3D-Liquid-Cube-Simulation](https://github.com/Subham503/3D-Liquid-Cube-Simulation) — Subham503 (MIT)
-- [Gesture-Canvas](https://github.com/RutujaKhule/Gesture-Canvas) — RutujaKhule / GestureCanvas Contributors (MIT)
-- [selfie-puzzle-game](https://github.com/krishaagor-source/selfie-puzzle-game) — Krisha Gor (MIT)
-- [Hand-AR](https://github.com/CoshkaX/Hand-AR) — Mehmet Akif Çoşkun (MIT reference for One-Euro filter & camera probing)
-- [Hand-Tracking-AR-UI](https://github.com/tubakhxn/Hand-Tracking-AR-UI) — Tuba Khan (MIT visual reference for radial AR hand HUD)
